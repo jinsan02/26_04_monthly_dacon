@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data (GitHub 100MB 제한 - 제외)
+data/raw/*.csv
+data/meta/*.csv
+data/submission/submission*.csv
+
+# Results (optional - version history)
+# data/submission/submission_v2_*.csv
+
+# System
+.DS_Store
+Thumbs.db
