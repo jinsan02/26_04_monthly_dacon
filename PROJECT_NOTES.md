@@ -13,7 +13,10 @@ dacon/
 │   └── submission/
 │       ├── sample_submission.csv
 │       ├── submission.csv          # v1 제출 결과
-│       └── submission_v2.csv       # v2 제출 결과 ✅
+│       ├── submission_v2.csv       # v2 제출 결과 ✅
+│       ├── submission_v3_*.csv     # v3 제출 결과 (timestamp)
+│       ├── submission_v4_*.csv     # v4 제출 결과 (timestamp)
+│       └── submission_v5_*.csv     # v5 단일 CatBoost 제출 결과
 ├── notebooks/
 │   └── [Baseline]_LightGBM 기반 스마트 창고 출고 지연 예측.ipynb
 ├── reports/
@@ -25,10 +28,18 @@ dacon/
 │       ├── 05_pairplot_top_features.png        # 주요 피처 Pairplot ✅
 │       ├── 06_feature_importance_top40.png     # 전체 피처 중요도 Top 40 ✅
 │       ├── 07_layout_feature_importance.png    # layout 파생 피처 중요도 ✅
-│       └── feature_importance.csv              # 전체 피처 중요도 수치 ✅
+│       ├── 08_feature_importance_v3_top40.png  # v3/v4 전체 피처 중요도 Top 40
+│       ├── 09_layout_feature_importance_v3.png # v3/v4 layout 피처 중요도
+│       ├── 10_v3_new_features_importance.png   # v3 신규 피처 중요도
+│       ├── feature_importance.csv              # v2 중요도 수치 ✅
+│       └── feature_importance_v3.csv           # v3/v4 중요도 수치 ✅
 ├── src/
 │   ├── baseline_lightgbm.py        # v1 개선 베이스라인
 │   ├── baseline_lightgbm_v2.py     # v2 최종 코드 (layout 통합)
+│   ├── baseline_lightgbm_v3.py     # v3 개선 코드
+│   ├── baseline_lightgbm_v4.py     # v4 일반화 특화 코드
+│   ├── baseline_lightgbm_v5.py     # v5 CatBoost + 제출물 중심 코드 (최신)
+│   ├── report_importance.py        # 중요도 시각화 분리 스크립트
 │   └── eda_visualize.py            # EDA 시각화 스크립트
 ├── requirements.txt
 └── PROJECT_NOTES.md
@@ -140,41 +151,144 @@ v2 학습 완료 후 자동 저장 (✅ 생성 완료):
 | `07_layout_feature_importance.png` | layout 파생 피처만 강조 |
 | `feature_importance.csv` | 전체 피처 중요도 수치 |
 
+### Step 9 — v3 개선 (OOF/Public 괴리 대응)
+
+v2 대비 추가 사항:
+
+| 항목 | 내용 |
+|---|---|
+| Smoothed Target Encoding 강화 | Additive smoothing(`alpha=10`) 유지 + unknown fallback 안정화 |
+| 시계열 피처 추가 | `time_idx`(시나리오 내 순번), `cumulative_inflow`, `cumulative_inflow_lag1` |
+| Rolling 확장 | window=3,4 → 3,4,5 |
+| 로그 변환 실험 토글 | `USE_LOG_TRANSFORM` 상수로 log 학습/원본 학습 비교 가능 |
+| 출력 분리 | 학습 스크립트는 submission + importance CSV만 저장 |
+
+### Step 10 — v4 일반화 특화 개선 (신규 레이아웃 대응)
+
+핵심 목표: **처음 보는 layout_id에서도 성능 유지**
+
+| 전략 | 내용 |
+|---|---|
+| 전략 1: 클러스터 기반 TE | `layout_id_target_enc` → `layout_cluster_target_enc` 전환 |
+|  | layout_info 물리 피처로 K-Means(`k=10`) 클러스터 생성 후 Fold-safe encoding |
+| 전략 2: 물리 병목 강화 | `path_complexity = (floor_area_sqm / obstacle_ratio) / rack_count` 추가 |
+|  | `congestion_persistence`(최근 3슬롯 congestion std) 추가 |
+| 전략 3: 학습 조건 조정 | `objective="quantile"`, `alpha=0.55` 적용 |
+|  | `colsample_bytree=0.7`로 특정 피처 의존도 완화 |
+
+### Step 11 — 중요도 리포트 스크립트 분리
+
+- `src/report_importance.py` 신설
+- 입력: `reports/eda/feature_importance_v3.csv`
+- 출력:
+  - `08_feature_importance_v3_top40.png`
+  - `09_layout_feature_importance_v3.png`
+  - `10_v3_new_features_importance.png`
+
+### Step 12 — v5 (Back to Basics + Smart Ratio + CatBoost)
+
+핵심 목표: **단일 모델로 일반화 성능 극대화 (Unseen layout 대응)**
+
+| 항목 | 내용 |
+|---|---|
+| 모델 엔진 | `CatBoostRegressor` 단일 모델 사용 |
+| 손실함수 | `loss_function="Quantile:alpha=0.55"`, `eval_metric="MAE"` |
+| 로그 변환 | `USE_LOG_TRANSFORM=True` 유지 (롱테일 안정화) |
+| 레이아웃 일반화 | layout 물리 피처 기반 `layout_cluster_id`(k=15) 생성 후 `cat_features`로 학습 |
+| ID/TE 제어 | `layout_id_target_enc`, `layout_cluster_target_enc` 제거 (암기 신호 차단) |
+| Ratio 피처 | `robot_active_per_area`, `inflow_per_aisle`, `congestion_vs_scenario_mean` |
+| 상호작용 피처 | `ops_pressure_idx`, `human_robot_density`, `congestion_tenure_weighted`, `network_instability`, `environment_stress` |
+| 출력 정책 | 제출물 단일 CSV만 저장 (`submission_v5_*.csv`) |
+
+v5 생성 결과:
+- `submission_v5_*.csv`
+
+### Step 13 — v6 (피처 다이어트 + 상호작용 강화)
+
+핵심 목표: **Permutation Importance 기반 피처 선별 → 과적합 최소화**
+
+| 항목 | 내용 |
+|---|---|
+| 모델 엔진 | `CatBoostRegressor` 단일 모델 |
+| 손실함수 | `loss_function="Quantile:alpha=0.52"`, `eval_metric="MAE"` (v5에서 0.55→0.52로 조정) |
+| 로그 변환 | `USE_LOG_TRANSFORM=False` (원본 MAE 직접 최적화) |
+| 피처 선별 전략 | 1차 학습 후 Permutation Importance 기반 Top-150 피처 선택 → 2차 재학습 |
+| 레이아웃 클러스터링 | K-Means(k=10) 유지 |
+| 비선형 상호작용 | `exp(congestion_score / 100) * sensor_noise_stress` 등 비선형 결합 |
+| 출력 정책 | 제출물 단일 CSV (`submission_v6_*.csv`) |
+
+v6 특징:
+- v5의 모든 파생 피처 유지하면서 Permutation으로 중요도 낮은 피처 제거
+- 모델 복잡도 감소 → 테스트셋 일반화 성능 향상
+- 실행 시간 단축
+
+v6 생성 결과:
+- `submission_v6_*.csv`
+
+### Step 14 — v7 (최종 최적화: PCA + Cyclic Time + Permutation)
+
+핵심 목표: **시간/공간 고도화 + 극도의 피처 효율화 (Top-110)**
+
+| 항목 | 내용 |
+|---|---|
+| 모델 엔진 | `CatBoostRegressor` 단일 모델 (Deep Squeeze 적용) |
+| 손실함수 | `loss_function="Quantile:alpha=0.52"`, `eval_metric="MAE"` |
+| 로그 변환 | `USE_LOG_TRANSFORM=True` (Long-tail 안정화) |
+| Layout 잠재인수 | Layout 물리 피처를 PCA(`n_components=3`) 압축 → `layout_pca_1`, `layout_pca_2`, `layout_pca_3` |
+| 시간 특성화 | Cyclic Time Encoding: scenario 내 15분 슬롯을 sin/cos로 변환 |
+| 피처 다이어트 | Permutation Importance 기반 `TOP_N_FEATURES=110` (PERM_CANDIDATE=220) |
+|  | 1차 학습 → Permutation 계산(`PERM_SAMPLE_SIZE=25000`) → 2차 재학습 |
+| 클러스터링 | K-Means(k=10) 유지 |
+| 출력 정책 | 제출물 단일 CSV (`submission_v7_*.csv`) |
+
+v7 신규 기능:
+- `add_layout_pca()`: PCA로 layout 물리 피처 차원 축약
+- Cyclic Time Encoding: 시간 정보를 원형 좌표로 표현
+- Permutation Importance 2단계 재학습: 최고 효율의 피처셋 구성
+
+v7 생성 결과:
+- `submission_v7_*.csv`
+
 ---
 
-## 3. 전체 실행 파이프라인 (v2)
+## 3. 전체 실행 파이프라인 (v7 최신)
 
 ```
 데이터 로드
   ↓
 layout_info Left Join (layout_id 기준)
   ↓
-물리·운영 파생 피처 생성
+Layout PCA 압축 (n_components=3) → layout_pca_1, layout_pca_2, layout_pca_3
+  ↓
+물리·운영 파생 피처 + Ratio/HRI/통신/환경 상호작용 피처 생성
+  ↓
+Cyclic Time Encoding (sin/cos 변환)
   ↓
 Lag(1,2) / Diff(1) 피처
   ↓
-Rolling(3,4) Mean / Max / Std 피처
+Rolling(3,4,5) Mean / Max / Std 피처
   ↓
 시나리오 통계 피처 (scenario_id 기준 mean/std)
   ↓
-K-Means 레이아웃 클러스터링 (layout_group)
-  ↓
-Fold-safe 타깃 인코딩 (layout_id_target_enc)
+K-Means 레이아웃 클러스터링 (layout_cluster_id, k=10)
   ↓
 결측치 플래그 생성 → 시나리오 내 ffill/bfill → 중앙값 fallback
   ↓
-카테고리 피처 선언 (layout_group, layout_type_enc)
+카테고리 피처 선언 (layout_cluster_id, layout_type_enc)
   ↓
-GroupKFold 5-fold 학습
+[1차 학습] GroupKFold 5-fold + CatBoost 
   · 타깃 log1p 변환 / 예측 expm1 복원
-  · objective = regression_l1 (MAE 직접 최적화)
-  · early_stopping patience=150
+  · loss_function = Quantile(alpha=0.52), eval_metric = MAE
+  ↓
+Permutation Importance 계산 (25,000 샘플 기준)
+  ↓
+Top-110 피처만 선별
+  ↓
+[2차 학습] 선별된 피처로 재학습
   ↓
 OOF MAE 출력
   ↓
-피처 중요도 이미지·CSV 저장 (reports/eda/)
-  ↓
-submission_v2.csv 저장 (data/submission/)
+submission_v7_YYYYMMDD_HHMMSS.csv 저장 (data/submission/)
 ```
 
 ---
@@ -190,13 +304,57 @@ python src/baseline_lightgbm.py
 
 # v2 학습 (layout_info 포함 전체 파이프라인)
 python src/baseline_lightgbm_v2.py
+
+# v3 학습 (시계열 피처 강화)
+python src/baseline_lightgbm_v3.py
+
+# v4 학습 (클러스터 기반 TE + HRI/통신)
+python src/baseline_lightgbm_v4.py
+
+# v5 학습 (CatBoost 전환, 일반화)
+python src/baseline_catboost_v5.py
+
+# v6 학습 (피처 다이어트 + 상호작용)
+python src/baseline_catboost_v6.py
+
+# v7 학습 (최신: PCA + Cyclic Time + Permutation)
+python src/baseline_catboost_v7.py
+
+# 중요도 시각화 (분리 실행)
+python src/report_importance.py --csv reports/eda/feature_importance_v3.csv
 ```
 
 ---
 
-## 5. 향후 고려 사항
+## 5. 제출 파일 이력
 
-- **CatBoost / XGBoost 앙상블**: `build_lgbm()` 구조를 활용해 모델 빌더 함수만 추가하면 `run_cv()` 재사용 가능
+| 파일 | 버전 | 전략 | 상태 |
+|---|---|---|---|
+| `submission.csv` | v1 | Log + GroupKFold 기본 | ✅ |
+| `submission_v2.csv` | v2 | Layout 통합 | ✅ |
+| `submission_v3_*.csv` | v3 | 시계열 피처 | ✅ |
+| `submission_v4_*.csv` | v4 | 클러스터 TE + HRI | ✅ |
+| `submission_v5_*.csv` | v5 | CatBoost 단일 | ✅ |
+| `submission_v6_*.csv` | v6 | 피처 다이어트 | ✅ |
+| `submission_v7_*.csv` | v7 | PCA + Cyclic Time + Permutation | 🔄 (코드 완성, 실행 예정) |
+
+---
+
+## 6. GitHub 업로드 이력
+
+- 원격 저장소: `jinsan02/26_04_monthly_dacon` (private)
+- 초기 푸시 중 `train.csv`(100MB 초과) 문제 발생
+- 해결:
+  - `.gitignore`로 `data/raw/*.csv`, `data/meta/*.csv` 제외
+  - Git 히스토리 정리 후 코드/리포트 중심으로 재커밋
+- 현재 방향: **데이터 파일 제외 + 코드/문서/리포트만 버전관리**
+- 최신 커밋 (2026-04-26): v3~v7 문서화 추가
+
+---
+
+## 7. 향후 고려 사항
+
+- **XGBoost 추가 앙상블**: v7 CatBoost + 기존 LightGBM(v2/v4) + XGBoost 가중 평균 비교
 - **가중 평균 앙상블**: LightGBM 0.4 : CatBoost 0.3 : XGBoost 0.3 비율
 - **Optuna HPO**: `build_lgbm()` 파라미터를 trial 객체로 교체하면 즉시 튜닝 가능
-- **학습률 추가 조정**: `learning_rate=0.01` + `n_estimators=3000` 현재 설정 → 시간 여유 시 0.005로 낮추고 더 높여볼 것
+- **학습률 추가 조정**: v7의 `learning_rate`, `n_estimators`, `quantile alpha` 추가 최적화
