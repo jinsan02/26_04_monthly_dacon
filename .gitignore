@@ -38,6 +38,9 @@ data/submission/submission*.csv
 # Results (optional - version history)
 # data/submission/submission_v2_*.csv
 
+# CatBoost artifacts
+catboost_info/
+
 # System
 .DS_Store
 Thumbs.db
