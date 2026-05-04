@@ -38,7 +38,12 @@ dacon/
 │   ├── baseline_lightgbm_v2.py     # v2 최종 코드 (layout 통합)
 │   ├── baseline_lightgbm_v3.py     # v3 개선 코드
 │   ├── baseline_lightgbm_v4.py     # v4 일반화 특화 코드
-│   ├── baseline_lightgbm_v5.py     # v5 CatBoost + 제출물 중심 코드 (최신)
+│   ├── baseline_catboost_v5.py     # v5 CatBoost + 제출물 중심 코드
+│   ├── baseline_catboost_v6.py     # v6 피처 다이어트 (Permutation Importance)
+│   ├── baseline_catboost_v7.py     # v7 PCA + Cyclic Time + Permutation
+│   ├── baseline_catboost_v8.py     # v8 CatBoost 3시드 앙상블
+│   ├── baseline_catboost_v9.py     # v9 CatBoost 3시드 앙상블 (블렌딩 제거)
+│   ├── baseline_lightgbm_v10.py    # v10 LightGBM + v9 로직 (최신) ⭐
 │   ├── report_importance.py        # 중요도 시각화 분리 스크립트
 │   └── eda_visualize.py            # EDA 시각화 스크립트
 ├── requirements.txt
@@ -336,7 +341,10 @@ python src/report_importance.py --csv reports/eda/feature_importance_v3.csv
 | `submission_v4_*.csv` | v4 | 클러스터 TE + HRI | ✅ |
 | `submission_v5_*.csv` | v5 | CatBoost 단일 | ✅ |
 | `submission_v6_*.csv` | v6 | 피처 다이어트 | ✅ |
-| `submission_v7_*.csv` | v7 | PCA + Cyclic Time + Permutation | 🔄 (코드 완성, 실행 예정) |
+| `submission_v7_*.csv` | v7 | PCA + Cyclic Time + Permutation | ✅ |
+| `submission_v8_*.csv` | v8 | CatBoost 3시드 앙상블 | ✅ |
+| `submission_v9_*.csv` | v9 | CatBoost 3시드 앙상블 (블렌딩 제거) | ✅ |
+| `submission_v10_*.csv` | v10 | LightGBM + v9 로직 3시드 앙상블 | ✅ |
 
 ---
 
@@ -349,12 +357,77 @@ python src/report_importance.py --csv reports/eda/feature_importance_v3.csv
   - Git 히스토리 정리 후 코드/리포트 중심으로 재커밋
 - 현재 방향: **데이터 파일 제외 + 코드/문서/리포트만 버전관리**
 - 최신 커밋 (2026-04-26): v3~v7 문서화 추가
+- 최신 커밋 (2026-05-04): v8/v9/v10 전체 코드·문서 추가, 대회 참여 완료
 
 ---
 
 ## 7. 향후 고려 사항
 
-- **XGBoost 추가 앙상블**: v7 CatBoost + 기존 LightGBM(v2/v4) + XGBoost 가중 평균 비교
+- **XGBoost 추가 앙상블**: v10 LightGBM + CatBoost(v9) + XGBoost 가중 평균 비교
 - **가중 평균 앙상블**: LightGBM 0.4 : CatBoost 0.3 : XGBoost 0.3 비율
 - **Optuna HPO**: `build_lgbm()` 파라미터를 trial 객체로 교체하면 즉시 튜닝 가능
-- **학습률 추가 조정**: v7의 `learning_rate`, `n_estimators`, `quantile alpha` 추가 최적화
+- **학습률 추가 조정**: v10의 `learning_rate`, `n_estimators` 추가 최적화
+
+---
+
+## 8. v8/v9/v10 상세 개선 이력
+
+### Step 15 — v8 (CatBoost 3시드 앙상블 도입)
+
+핵심 목표: **멀티 시드로 예측 분산 감소**
+
+| 항목 | 내용 |
+|---|---|
+| 모델 엔진 | `CatBoostRegressor` (v6 기반 유지) |
+| 앙상블 전략 | seed=[42, 10, 2026] 각각 독립 학습 후 OOF/test 평균 |
+| Stage 구성 | Stage1: 전체 피처 학습 → importance 집계 / Stage2: Top-150 재학습 |
+| 로그 변환 | `USE_LOG_TRANSFORM=False` (원본 MAE 직접 최적화) |
+| 손실함수 | Quantile(alpha=0.52) + MAE metric |
+| 출력 | `submission_v8_*.csv` |
+
+### Step 16 — v9 (블렌딩 제거, 3시드 앙상블 정제)
+
+핵심 목표: **불필요한 복잡도 제거, 3시드 단순 평균만 유지**
+
+| 항목 | 내용 |
+|---|---|
+| 모델 엔진 | `CatBoostRegressor` |
+| v8 대비 변경 | 블렌딩 로직 완전 제거, 3시드 평균만 유지 |
+| 나머지 | v8과 동일 구조 (Top-150, log=False, Quantile) |
+| 출력 | `submission_v9_*.csv` |
+
+### Step 17 — v10 (LightGBM 복귀 + v9 로직 전체 이식) ⭐
+
+핵심 목표: **v9의 앙상블·피처 전략을 LightGBM 엔진으로 포팅**
+
+| 항목 | 내용 |
+|---|---|
+| 모델 엔진 | `LGBMRegressor`, objective=regression_l1 |
+| 로그 변환 | `USE_LOG_TRANSFORM=True` 복원 (롱테일 안정화) |
+| GroupKFold 기준 | `layout_id` (미지 레이아웃 일반화 강화) |
+| Layout PCA | `n_components=3` → layout_pca_capacity, complexity, efficiency |
+| 물리 메커닉 피처 | `saturation_index`, `explosion_factor`, `density_stress`, `workload_intensity`, `congestion_velocity` |
+| 앙상블 | seeds=[42, 10, 2026] 3시드 평균 |
+| Stage | Stage1 importance 평균 → Stage2 Top-150 재학습 |
+| 총 피처 수 | 약 352개 |
+| 출력 | `submission_v10_*.csv` |
+
+**물리 메커닉 피처 정의:**
+
+| 피처 | 계산 방법 | 의도 |
+|---|---|---|
+| `saturation_index` | `order_inflow_15m / (robot_active + 1)` | 로봇 포화도 |
+| `explosion_factor` | `congestion_score * (1 + low_battery_ratio)` | 혼잡 폭발 위험도 |
+| `density_stress` | `floor_area_per_robot * congestion_score` (fallback: congestion) | 밀도 기반 스트레스 |
+| `workload_intensity` | `order_inflow_15m * congestion_score / 100` | 워크로드 강도 |
+| `congestion_velocity` | congestion diff1 (congestion 변화율) | 혼잡 가속도 |
+
+---
+
+## 9. 대회 참여 완료 기록
+
+- **대회명**: DACON 스마트 창고 출고 지연 예측
+- **최종 제출 버전**: v10 (LightGBM + 3시드 앙상블)
+- **완료일**: 2026-05-04
+- **최종 파일**: `submission_v10_*.csv`
+- **전략 요약**: log transform + layout_id GroupKFold + 물리 메커닉 피처 + 3시드 앙상블 + Top-150 Stage2 재학습

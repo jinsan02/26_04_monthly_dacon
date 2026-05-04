@@ -32,7 +32,10 @@ dacon/
 │   ├── baseline_lightgbm_v4.py       # v4: 클러스터 TE + HRI/통신 지표
 │   ├── baseline_catboost_v5.py       # v5: CatBoost 단일 모델 (일반화)
 │   ├── baseline_catboost_v6.py       # v6: 피처 다이어트 (Permutation Importance)
-│   ├── baseline_catboost_v7.py       # v7: PCA + Cyclic Time + Permutation (최신)
+│   ├── baseline_catboost_v7.py       # v7: PCA + Cyclic Time + Permutation
+│   ├── baseline_catboost_v8.py       # v8: 3시드 앙상블 도입 (CatBoost)
+│   ├── baseline_catboost_v9.py       # v9: CatBoost 3시드 앙상블 (블렌딩 제거)
+│   ├── baseline_lightgbm_v10.py      # v10: LightGBM + v9 로직 (최신) ⭐
 │   ├── eda_visualize.py              # EDA 이미지 생성
 │   └── report_importance.py          # 중요도 시각화 분리
 ├── requirements.txt
@@ -85,12 +88,33 @@ dacon/
 - **Quantile Fine-tuning**: alpha=0.52로 조정
 - **Log Transform Off**: 원본 MAE 직접 최적화
 
-### v7 — 최종 최적화 (PCA + Cyclic Time + Permutation)
+### v7 — PCA + Cyclic Time + Permutation
 - **Layout PCA**: 물리 피처를 PCA(n_components=3) 압축 → 잠재 인수 추가
 - **Cyclic Time Encoding**: 15분 슬롯을 sin/cos로 변환 (원형 성질 반영)
 - **Extreme Feature Diet**: Permutation 기반 Top-110 피처만 선별
 - **Deep Squeeze**: 모든 피처 공학 기법 적용 후 최소 피처셋으로 최고 성능 추구
 - **Log Transform Restored**: 롱테일 분포 안정화 (USE_LOG_TRANSFORM=True)
+
+### v8 — 3시드 앙상블 도입 (CatBoost)
+- **Multi-Seed Ensemble**: seed=[42, 10, 2026] 각각 학습 후 평균 앙상블
+- **Base**: v6 파이프라인 유지 (Top-150 피처, Quantile alpha=0.52)
+- **Log Transform**: False 고정 (원본 MAE 직접 최적화)
+- **Stage 구성**: Stage1 importance 평균 → Stage2 Top-150 재학습 → 3시드 평균
+
+### v9 — CatBoost 3시드 앙상블 정제 (블렌딩 제거)
+- **Blending 제거**: 단순 3시드 평균 앙상블만 유지 (불필요 복잡도 제거)
+- **Base**: v8과 동일 구조 (Top-150, log_transform=False, Quantile)
+- **Output**: `submission_v9_*.csv` 단일 출력
+
+### v10 — LightGBM 복귀 + v9 로직 전체 이식 ⭐ (최신)
+- **Model Engine**: CatBoost → `LGBMRegressor` 복귀 (objective=regression_l1)
+- **Log Transform**: True 복원 (롱테일 안정화)
+- **GroupKFold**: `layout_id` 기준으로 강화 (미지 레이아웃 일반화)
+- **Physical Mechanics Features**: `saturation_index`, `explosion_factor`, `density_stress`, `workload_intensity`, `congestion_velocity` 추가
+- **Layout PCA**: n_components=3 (layout_pca_capacity, complexity, efficiency)
+- **Multi-Seed Ensemble**: seeds=[42, 10, 2026] 3시드 평균
+- **Stage2 Top-150**: importance 평균 기반 피처 선별 재학습
+- **총 피처 수**: ~352개
 
 ---
 
@@ -152,11 +176,26 @@ python src/baseline_catboost_v5.py
 python src/baseline_catboost_v6.py
 ```
 
-### 9. v7 학습 (최신: PCA + Cyclic Time + Permutation) ⭐
+### 9. v7 학습 (PCA + Cyclic Time + Permutation)
 ```bash
 python src/baseline_catboost_v7.py
-# → 최고 효율의 피처셋으로 학습 완료
-# → data/submission/ 에 submission_v7_YYYYMMDD_HHMMSS.csv 생성
+```
+
+### 10. v8 학습 (CatBoost 3시드 앙상블)
+```bash
+python src/baseline_catboost_v8.py
+```
+
+### 11. v9 학습 (CatBoost 3시드, 블렌딩 제거)
+```bash
+python src/baseline_catboost_v9.py
+```
+
+### 12. v10 학습 (최신: LightGBM + v9 로직) ⭐
+```bash
+conda activate dacon
+python src/baseline_lightgbm_v10.py
+# → data/submission/ 에 submission_v10_YYYYMMDD_HHMMSS.csv 생성
 ```
 
 ---
@@ -175,12 +214,11 @@ python src/baseline_catboost_v7.py
   - num_leaves: 127
   - subsample/colsample_bytree: 0.85
 
-### CatBoost (v5~v7)
+### CatBoost (v5~v9)
 - **Framework**: CatBoost (Gradient Boosting on Decision Trees)
 - **Objective**: 
   - v5: Quantile(alpha=0.55) + MAE
-  - v6: Quantile(alpha=0.52) + MAE
-  - v7: Quantile(alpha=0.52) + MAE
+  - v6~v9: Quantile(alpha=0.52) + MAE
 - **CV Strategy**: GroupKFold (N=5) by scenario_id
 - **Key Parameters**:
   - loss_function: Quantile/MAE
@@ -189,10 +227,27 @@ python src/baseline_catboost_v7.py
   - depth: 6~8
   - learning_rate: 0.1~0.05
   - cat_features: layout_cluster_id, layout_type_enc
-- **v7 Specifics**:
+- **v8/v9 Specifics**:
+  - Multi-Seed Ensemble: seeds=[42, 10, 2026]
+  - Stage1 importance 평균 → Stage2 Top-150 재학습
+  - v9: 블렌딩 제거, 3시드 평균만 유지
+
+### LightGBM v10 (최신) ⭐
+- **Framework**: LightGBM (`LGBMRegressor`)
+- **Objective**: `regression_l1` (MAE 직접 최적화)
+- **CV Strategy**: GroupKFold (N=5) by `layout_id`
+- **Key Parameters**:
+  - learning_rate: 0.05
+  - n_estimators: 3000
+  - num_leaves: 127
+  - subsample/colsample_bytree: 0.85/0.7
+  - early_stopping_rounds: 150
+- **v10 Specifics**:
+  - Log Transform: True
+  - Physical Mechanics Features: saturation_index, explosion_factor, density_stress, workload_intensity, congestion_velocity
   - Layout PCA: n_components=3
-  - Cyclic Time: sin/cos encoding
-  - Feature Diet: Top-110 Permutation-based selection
+  - Multi-Seed Ensemble: seeds=[42, 10, 2026]
+  - Stage2 Top-150 feature selection
 
 ---
 
@@ -234,5 +289,6 @@ python src/baseline_catboost_v7.py
 ---
 
 **Author**: dacon_user  
-**Last Updated**: 2026-04-26  
-**Latest Model**: v7 (CatBoost + PCA + Cyclic Time + Permutation)
+**Last Updated**: 2026-05-04  
+**Latest Model**: v10 (LightGBM + v9 Logic + 3-Seed Ensemble) ⭐  
+**Competition Status**: 참여 완료

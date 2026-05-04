@@ -1,10 +1,10 @@
-"""Smart warehouse delay prediction — v7 (Simplify & Interaction++).
+"""Smart warehouse delay prediction — v8 (Multi-Seed Ensemble).
 
 핵심 전략:
-1) 단일 모델: CatBoostRegressor (Deep Squeeze)
-2) 시간/공간 고도화: Cyclic Time + Layout PCA
-3) 피처 다이어트: Permutation Importance 기반 Top-N 재학습
-4) 앙상블 없이 submission_v7 단일 출력
+1) v6 파이프라인 유지 + 멀티시드 앙상블
+2) seed=42,10,2026 각각 학습 후 평균 앙상블
+3) Top 150 피처 다이어트 유지
+4) log_transform=False 고정
 """
 
 from datetime import datetime
@@ -16,7 +16,6 @@ from catboost import CatBoostRegressor
 from sklearn.cluster import KMeans
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import GroupKFold
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 
@@ -44,6 +43,9 @@ ROLLING_WINDOWS = [3, 4, 5]
 # True: log1p(y) 학습 / False: 원본 MAE 직접 최적화
 USE_LOG_TRANSFORM = False
 
+# v8 멀티시드 앙상블
+ENSEMBLE_SEEDS = [42, 10, 2026]
+
 # v5는 TE/ID 암기 신호를 제거하되, layout_cluster_id는 유지한다.
 DROP_COLS = ["layout_id_target_enc", "layout_cluster_target_enc"]
 
@@ -54,17 +56,8 @@ N_LAYOUT_CLUSTERS = 10
 # is_missing 피처 fold-평균 중요도 하한
 MISSING_IMP_THRESHOLD = 10.0
 
-# v7 피처 다이어트 목표 (Permutation 기반)
-TOP_N_FEATURES = 110
-PERM_CANDIDATE_FEATURES = 220
-PERM_SAMPLE_SIZE = 25000
-PERM_RANDOM_STATE = 42
-
-# PCA 기반 레이아웃 잠재 요인 수
-N_LAYOUT_PCA = 3
-
-# Quantile 미세 튜닝 (0.51~0.53 권장 구간)
-QUANTILE_ALPHA = 0.52
+# v6 피처 다이어트 목표 (권장 범위: 100~150)
+TOP_N_FEATURES = 150
 
 # v5 체크 대상: HRI/통신/환경 핵심 피처
 FOCUS_FEATURE_KEYS = [
@@ -106,34 +99,6 @@ def merge_layout_info(
 
     train = train.merge(li.drop(columns=["layout_type"]), on="layout_id", how="left")
     test = test.merge(li.drop(columns=["layout_type"]), on="layout_id", how="left")
-    return train, test
-
-
-def add_layout_pca(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
-    layout_info: pd.DataFrame,
-    n_components: int = N_LAYOUT_PCA,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """layout_info의 연속형 물리 피처를 PCA로 압축하여 잠재 요인 추가."""
-    li = layout_info.copy()
-    numeric_cols = li.select_dtypes(include=["number"]).columns.tolist()
-    if not numeric_cols:
-        return train, test
-
-    scaler = StandardScaler()
-    X = scaler.fit_transform(li[numeric_cols].fillna(0))
-
-    n_comp = min(n_components, X.shape[1])
-    pca = PCA(n_components=n_comp, random_state=42)
-    comps = pca.fit_transform(X)
-
-    comp_cols = [f"layout_pca_{i+1}" for i in range(n_comp)]
-    pca_df = pd.DataFrame(comps, columns=comp_cols, index=li.index)
-    pca_df.insert(0, "layout_id", li["layout_id"].values)
-
-    train = train.merge(pca_df, on="layout_id", how="left")
-    test = test.merge(pca_df, on="layout_id", how="left")
     return train, test
 
 
@@ -352,42 +317,6 @@ def add_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_cyclic_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    """시간 컬럼이 존재하면 Sin/Cos 주기 인코딩 추가."""
-    new: dict[str, pd.Series] = {}
-
-    for col, period in [("shift_hour", 24), ("hour", 24), ("time_slot", 24)]:
-        if col in df.columns:
-            val = df[col].astype(float)
-            new[f"{col}_sin"] = np.sin(2 * np.pi * val / period)
-            new[f"{col}_cos"] = np.cos(2 * np.pi * val / period)
-            break
-
-    if new:
-        df = pd.concat([df, pd.DataFrame(new, index=df.index)], axis=1)
-    return df
-
-
-def add_short_term_dynamics(df: pd.DataFrame) -> pd.DataFrame:
-    """30분 혼잡 평균과 주문 변화율(gradient) 추가."""
-    if "scenario_id" not in df.columns:
-        return df
-
-    work = df.sort_values(_get_sort_keys(df)).copy()
-
-    if "congestion_score" in work.columns:
-        shifted = work.groupby("scenario_id")["congestion_score"].shift(1)
-        work["congestion_30m_mean"] = shifted.groupby(work["scenario_id"]).transform(
-            lambda x: x.rolling(2, min_periods=1).mean()
-        )
-
-    if "order_inflow_15m" in work.columns:
-        prev = work.groupby("scenario_id")["order_inflow_15m"].shift(1)
-        work["order_inflow_gradient"] = (work["order_inflow_15m"] - prev) / (prev.abs() + 1)
-
-    return work.sort_index()
-
-
 # ---------------------------------------------------------------------------
 # Feature Engineering
 # ---------------------------------------------------------------------------
@@ -595,22 +524,17 @@ def impute_features(
 # Model
 # ---------------------------------------------------------------------------
 
-def build_lgbm() -> CatBoostRegressor:
+def build_lgbm(seed: int) -> CatBoostRegressor:
     return CatBoostRegressor(
-        # v7 Deep Squeeze
-        loss_function=f"Quantile:alpha={QUANTILE_ALPHA}",
+        # 단일 모델 공략: Quantile(0.55)로 상향 편향을 약간 허용
+        loss_function="Quantile:alpha=0.55",
         eval_metric="MAE",
         iterations=3000,
         learning_rate=0.015,
-        depth=6,
-        l2_leaf_reg=12.0,
-        bootstrap_type="MVS",
-        subsample=0.8,
-        grow_policy="Lossguide",
-        max_leaves=64,
-        min_data_in_leaf=64,
+        depth=8,
+        l2_leaf_reg=4.0,
         od_type="Iter",
-        random_seed=42,
+        random_seed=seed,
         verbose=300,
     )
 
@@ -631,6 +555,7 @@ def run_cv(
     train: pd.DataFrame,
     test: pd.DataFrame,
     feature_cols: list[str],
+    seed: int,
 ) -> tuple[np.ndarray, np.ndarray, pd.Series]:
     groups = train["scenario_id"] if "scenario_id" in train.columns else None
     gkf = GroupKFold(n_splits=N_SPLITS)
@@ -650,7 +575,7 @@ def run_cv(
 
         cat_cols = X_tr.select_dtypes(include=["category", "object"]).columns.tolist()
 
-        model = build_lgbm()
+        model = build_lgbm(seed)
         model.fit(
             X_tr, y_tr,
             eval_set=[(X_val, y_val)],
@@ -686,59 +611,6 @@ def select_top_features(
     if dropped:
         print(f"[v6-prune] 제외 예시: {dropped[:10]}{'...' if len(dropped) > 10 else ''}")
     return selected
-
-
-def permutation_importance_one_fold(
-    train: pd.DataFrame,
-    feature_cols: list[str],
-    max_candidates: int = PERM_CANDIDATE_FEATURES,
-    sample_size: int = PERM_SAMPLE_SIZE,
-) -> pd.Series:
-    """첫 fold 검증셋에서 permutation importance 계산(원본 MAE 기준)."""
-    groups = train["scenario_id"] if "scenario_id" in train.columns else None
-    gkf = GroupKFold(n_splits=N_SPLITS)
-    tr_idx, val_idx = next(gkf.split(train, train[TARGET], groups=groups))
-
-    X_tr = train.loc[tr_idx, feature_cols]
-    X_val_full = train.loc[val_idx, feature_cols]
-    y_tr = _transform_target(train.loc[tr_idx, TARGET])
-    y_val_raw = train.loc[val_idx, TARGET].values
-
-    if len(X_val_full) > sample_size:
-        rng = np.random.default_rng(PERM_RANDOM_STATE)
-        pick = rng.choice(len(X_val_full), size=sample_size, replace=False)
-        X_val = X_val_full.iloc[pick].copy()
-        y_val_raw = y_val_raw[pick]
-    else:
-        X_val = X_val_full.copy()
-
-    cat_cols = X_tr.select_dtypes(include=["category", "object"]).columns.tolist()
-    model = build_lgbm()
-    model.fit(
-        X_tr,
-        y_tr,
-        eval_set=[(X_val, _transform_target(pd.Series(y_val_raw)))],
-        cat_features=cat_cols if cat_cols else None,
-        use_best_model=True,
-        early_stopping_rounds=150,
-    )
-
-    base_pred = _inverse_target(model.predict(X_val))
-    base_mae = mean_absolute_error(y_val_raw, base_pred)
-
-    gain_imp = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
-    candidates = gain_imp.head(min(max_candidates, len(gain_imp))).index.tolist()
-
-    rng = np.random.default_rng(PERM_RANDOM_STATE)
-    perm_scores: dict[str, float] = {}
-    for col in candidates:
-        shuffled = X_val.copy()
-        shuffled[col] = rng.permutation(shuffled[col].values)
-        pred = _inverse_target(model.predict(shuffled))
-        mae = mean_absolute_error(y_val_raw, pred)
-        perm_scores[col] = mae - base_mae
-
-    return pd.Series(perm_scores).sort_values(ascending=False)
 
 
 def monitor_focus_feature_importance(
@@ -784,8 +656,6 @@ def build_features(
     # 2. 시계열 / ratio / 상호작용 / HRI·인프라 피처
     for df_name, df in [("train", train), ("test", test)]:
         df = add_time_features(df)
-        df = add_cyclic_time_features(df)
-        df = add_short_term_dynamics(df)
         df = add_ratio_features(df)
         df = add_interaction_features(df)
         df = add_congestion_persistence(df)   # [전략 2] 병목 지속 지표
@@ -801,9 +671,8 @@ def build_features(
     # 3. 시나리오 통계
     train, test = add_scenario_stats(train, test, SCENARIO_STAT_COLS)
 
-    # 4. 일반화 핵심: layout cluster + layout PCA 잠재 요인
+    # 4. 일반화 핵심: layout cluster를 명시적으로 추가
     train, test = add_layout_cluster(train, test, layout_info, n_clusters=15)
-    train, test = add_layout_pca(train, test, layout_info, n_components=N_LAYOUT_PCA)
 
     # 5. 결측치 플래그 + 보간
     train, test = add_missing_flags(train, test)
@@ -846,49 +715,39 @@ def main() -> None:
     layout_info_path = project_root / "data" / "meta" / "layout_info.csv"
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_tag = "log_true" if USE_LOG_TRANSFORM else "log_false"
-    submission_path = project_root / "data" / "submission" / f"submission_v7_{ts}.csv"
-    perm_path = project_root / "reports" / "eda" / f"permutation_importance_v7_{log_tag}.csv"
-    selected_path = project_root / "reports" / "eda" / f"selected_features_v7_{log_tag}.txt"
+    submission_path = project_root / "data" / "submission" / f"submission_v8_{ts}.csv"
 
     train = pd.read_csv(train_path)
     test = pd.read_csv(test_path)
     layout_info = pd.read_csv(layout_info_path)
     print(f"학습 데이터: {train.shape}  테스트 데이터: {test.shape}  레이아웃: {layout_info.shape}")
-    print(f"log transform: {USE_LOG_TRANSFORM} | tag: {log_tag}")
-    print(f"perm output: {perm_path.name}")
-    print(f"selected output: {selected_path.name}")
+    print(f"log transform: {USE_LOG_TRANSFORM} (v8 default=False)")
+    print(f"ensemble seeds: {ENSEMBLE_SEEDS}")
 
     train, test, feature_cols = build_features(train, test, layout_info)
     print(f"최종 피처 수: {len(feature_cols)}")
 
-    # 1차 학습: 전체 피처로 importance 추출
-    oof_preds, test_preds, importance = run_cv(train, test, feature_cols)
+    # 1차 학습: 시드별 importance를 평균내어 안정적인 Top-N 선택
+    importance_seed_sum = pd.Series(np.zeros(len(feature_cols), dtype=float), index=feature_cols)
+    for seed in ENSEMBLE_SEEDS:
+        print(f"\n[Stage1] seed={seed}")
+        _, _, imp_seed = run_cv(train, test, feature_cols, seed=seed)
+        importance_seed_sum += imp_seed
+    importance_avg = importance_seed_sum / len(ENSEMBLE_SEEDS)
 
-    # Permutation Importance(1 fold)로 실제 MAE 영향도 측정
-    perm_imp = permutation_importance_one_fold(
-        train,
-        feature_cols,
-        max_candidates=PERM_CANDIDATE_FEATURES,
-        sample_size=PERM_SAMPLE_SIZE,
-    )
-    perm_path.parent.mkdir(parents=True, exist_ok=True)
-    perm_imp.to_csv(perm_path, header=["mae_increase"])
-    print(f"permutation importance 저장 완료: {perm_path}")
+    # 2차 학습: Top-N 피처로 시드별 재학습 후 평균 앙상블
+    top_features = select_top_features(feature_cols, importance_avg, top_n=TOP_N_FEATURES)
 
-    # 2차 학습: permutation 기준 Top-N 선택
-    top_features = perm_imp.head(min(TOP_N_FEATURES, len(perm_imp))).index.tolist()
-    if len(top_features) < 100:
-        # 안전장치: 부족하면 gain importance로 보강
-        fill = [c for c in importance.sort_values(ascending=False).index if c not in top_features]
-        top_features += fill[: (100 - len(top_features))]
+    oof_seed_list: list[np.ndarray] = []
+    test_seed_list: list[np.ndarray] = []
+    for seed in ENSEMBLE_SEEDS:
+        print(f"\n[Stage2] seed={seed}")
+        oof_seed, test_seed, _ = run_cv(train, test, top_features, seed=seed)
+        oof_seed_list.append(oof_seed)
+        test_seed_list.append(test_seed)
 
-    with open(selected_path, "w", encoding="utf-8") as f:
-        for col in top_features:
-            f.write(f"{col}\n")
-    print(f"선택 피처 저장 완료: {selected_path} ({len(top_features)}개)")
-
-    oof_preds, test_preds, _ = run_cv(train, test, top_features)
+    oof_preds = np.mean(np.vstack(oof_seed_list), axis=0)
+    test_preds = np.mean(np.vstack(test_seed_list), axis=0)
 
     oof_mae = mean_absolute_error(train[TARGET], oof_preds)
     print(f"\nOOF MAE: {oof_mae:.6f}")
