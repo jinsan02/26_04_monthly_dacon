@@ -2,7 +2,7 @@
 
 **Competition**: DACON 스마트 창고 출고 지연 예측  
 **Date**: 2026-04-25  
-**Status**: Private Repository  
+**Status**: 대회 종료 · 공개 저장소  
 
 ---
 
